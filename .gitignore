@@ -1,0 +1,5 @@
+# Local config: contains your LAN device IPs and selections
+wled_bridge.yaml
+
+__pycache__/
+*.pyc

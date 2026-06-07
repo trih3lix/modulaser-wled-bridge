@@ -1,0 +1,7 @@
+python-osc
+requests
+zeroconf
+pyyaml
+# Optional, for NDI frame sync mode:
+# ndi-python
+# numpy
