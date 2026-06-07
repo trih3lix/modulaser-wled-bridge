@@ -431,6 +431,18 @@ def sample_zones(rgb, k):
     return out
 
 
+def ndi_to_rgb(data, w, h):
+    """Normalize a raw NDI BGRA buffer to an (h, w, 3) RGB array.
+
+    NDI frames sometimes arrive flat or with line-stride padding instead of
+    a clean (h, w, 4) shape; this handles all layouts."""
+    arr = np.asarray(data)
+    if arr.ndim != 3 or arr.shape[0] != h or arr.shape[1] != w:
+        flat = arr.reshape(h, -1)          # rows, possibly padded
+        arr = flat[:, :w * 4].reshape(h, w, 4)
+    return arr[..., 2::-1]
+
+
 # ---- NDI ---------------------------------------------------------------------------
 
 class NdiSource:
@@ -497,9 +509,10 @@ class NdiSource:
         ndi = self.ndi
         t, v, _, _ = ndi.recv_capture_v2(self.recv, int(timeout * 1000))
         if t == ndi.FRAME_TYPE_VIDEO:
-            frame = np.copy(v.data)[..., 2::-1]  # BGRA -> RGB
+            data = np.copy(v.data)
+            w, h = v.xres, v.yres
             ndi.recv_free_video_v2(self.recv, v)
-            return frame
+            return ndi_to_rgb(data, w, h)
         return None
 
     def close(self):
@@ -523,6 +536,7 @@ class FrameSync(threading.Thread):
         self.bridge = bridge
         self.debug = debug
         self._stop = threading.Event()
+        self._next_log = 0.0
         self._ddp = {}
         if mode == "gradient":
             self._ddp = {d.ip: DdpSender(d.ip.split(":")[0], ddp_port)
@@ -543,6 +557,12 @@ class FrameSync(threading.Thread):
             next_t = now + self.interval
             if self.bridge.blackout:
                 frame = None
+            if self.debug and frame is not None and now >= self._next_log:
+                self._next_log = now + 2.0
+                lit = float((_lum(frame) > LUM_THRESHOLD).mean()) * 100.0
+                head = sample_gradient(frame, 5).tolist()
+                print(f"[frame] shape={frame.shape} lit={lit:.1f}% "
+                      f"5-bin sample={head}")
             for d in self.devices:
                 if self.mode == "gradient":
                     if frame is None:
