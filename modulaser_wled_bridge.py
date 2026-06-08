@@ -35,12 +35,20 @@ Config lives in wled_bridge.yaml next to this script. Per-device mappings:
         1: [1, 2]
 
 While running, type commands to switch live (no restart needed):
-  mode osc | mode ndi [gradient|dominant|zones] | beat on|off | status | quit
+  mode osc | mode ndi [gradient|dominant|zones] | beat on|off | fill on|off |
+  status | quit
+
+fill_light mode inverts the relationship: LEDs stay dark while the lasers
+project and come on with the last laser color when the lasers go dark, so
+the LEDs never wash out the beams. Toggle live with 'fill on|off'.
 
 Extra config keys: beat_flash (BPM-synced brightness pulses),
 beat_flash_depth (how deep the pulse dips, 0-1), watchdog_minutes (restore
 normal lighting after the show goes quiet; 0 disables). Per-device
 idle_preset recalls a WLED preset number instead of the startup snapshot.
+fill_light / fill_threshold control fill-light mode (threshold = fraction of
+frame pixels lit above which the lasers count as projecting; NDI mode only,
+OSC mode keys off the blackout toggle).
 
 On exit (Ctrl+C or 'quit') each WLED device is restored to its prior state.
 """
@@ -83,6 +91,8 @@ DEFAULT_CONFIG = {
     "ndi_source": None,
     "beat_flash": False,
     "beat_flash_depth": 0.5,
+    "fill_light": False,
+    "fill_threshold": 0.002,
     "watchdog_minutes": 10,
     "devices": {},
     "selected": [],
@@ -538,7 +548,7 @@ class FrameSync(threading.Thread):
     """Pulls frames from a source and pushes sampled colors to the devices."""
 
     def __init__(self, frame_source, devices, mode, fps, bridge,
-                 ddp_port=4048, debug=False):
+                 ddp_port=4048, debug=False, fill_threshold=0.002):
         super().__init__(daemon=True)
         self.source = frame_source
         self.devices = devices
@@ -546,6 +556,10 @@ class FrameSync(threading.Thread):
         self.interval = 1.0 / max(1, fps)
         self.bridge = bridge
         self.debug = debug
+        self.fill_threshold = fill_threshold
+        self._fill_dark = False
+        self._held = None       # last dominant color while lasers were lit
+        self._last_fill = None  # last fill output (avoid JSON re-sends)
         self._stop_evt = threading.Event()
         self._next_log = 0.0
         self._ddp = {}
@@ -567,6 +581,9 @@ class FrameSync(threading.Thread):
             if now < next_t:
                 continue
             next_t = now + self.interval
+            if self.bridge.fill_enabled:
+                self._run_fill(frame)
+                continue
             if self.bridge.blackout:
                 frame = None
             if self.debug and frame is not None and now >= self._next_log:
@@ -595,6 +612,37 @@ class FrameSync(threading.Thread):
                         d.client.queue(
                             segment=seg,
                             seg_fields={"col": [[int(c) for c in rgb]]})
+
+
+    def _run_fill(self, frame):
+        """Fill-light mode: LEDs come on (with the last laser color) only
+        while the lasers are dark."""
+        lit = 0.0
+        if frame is not None and not self.bridge.blackout:
+            small = _downscale(frame)
+            lit = float((_lum(small) > LUM_THRESHOLD).mean())
+            if lit >= self.fill_threshold:
+                self._held = [int(c) for c in sample_dominant(frame)]
+        if frame is None or self.bridge.blackout:
+            self._fill_dark = True
+        elif lit >= self.fill_threshold:
+            self._fill_dark = False
+        elif lit <= self.fill_threshold * 0.5:
+            self._fill_dark = True
+        # else: inside the hysteresis band, keep the previous state
+        out = (self._held or [255, 255, 255]) if self._fill_dark else [0, 0, 0]
+        changed = out != self._last_fill
+        self._last_fill = list(out)
+        for d in self.devices:
+            if self.mode == "gradient":
+                # DDP realtime times out if we stop streaming, so always send
+                colors = np.tile(np.array(out, dtype=np.uint8),
+                                 (d.led_count, 1))
+                self._ddp[d.ip].send(colors.tobytes())
+            elif changed:
+                for seg in d.global_segs:
+                    d.client.queue(segment=seg,
+                                   seg_fields={"col": [list(out)]})
 
 
 # ---- Devices -------------------------------------------------------------------
@@ -637,6 +685,7 @@ class Bridge:
         self.idle = False          # set by the watchdog when the show goes quiet
         self.beat_enabled = False
         self.base_bri = 128
+        self.fill_enabled = False  # LEDs only when lasers are dark
 
     # -- helpers --
 
@@ -688,6 +737,8 @@ class Bridge:
                 return
             self.global_hsl[key] = value
             rgb = self._hsl_rgb(self.global_hsl)
+        if self.fill_enabled and not self.blackout:
+            return  # lasers projecting: LEDs stay dark, color is just remembered
         for client, seg in self._global_targets():
             client.queue(segment=seg, seg_fields={"col": [rgb]})
 
@@ -696,8 +747,21 @@ class Bridge:
         if not args:
             return
         self.blackout = float(args[0]) >= 0.5
+        if self.fill_enabled and not self.frame_sync:
+            self._apply_fill_osc()
+            return
         for d in self.devices:
             d.client.queue(top={"on": not self.blackout})
+
+    def _apply_fill_osc(self):
+        """OSC fill mode: lasers dark (blackout) -> show the held color;
+        lasers projecting -> LEDs off (black)."""
+        with self.lock:
+            rgb = self._hsl_rgb(self.global_hsl) if self.blackout else [0, 0, 0]
+        for d in self.devices:
+            d.client.queue(top={"on": True})
+        for client, seg in self._global_targets():
+            client.queue(segment=seg, seg_fields={"col": [rgb]})
 
     def on_group_opacity(self, address, *args):
         self.last_activity = time.time()
@@ -749,6 +813,8 @@ class Bridge:
                 rgb = [col["rgb"]["red"], col["rgb"]["green"], col["rgb"]["blue"]]
             else:
                 return  # not a color key (e.g. some other slot parameter)
+        if self.fill_enabled and not self.blackout:
+            return
         for client, seg in self._group_targets(group):
             client.queue(segment=seg, seg_fields={"col": [rgb]})
 
@@ -889,6 +955,7 @@ HELP_TEXT = """Live commands:
   mode osc                            follow OSC base color
   mode ndi [gradient|dominant|zones]  sample NDI frames
   beat on|off                         beat-synced brightness pulses
+  fill on|off                         LEDs only while lasers are dark
   status                              current source, BPM, devices
   help                                this list
   quit                                exit and restore WLED state"""
@@ -925,9 +992,10 @@ class Controller:
                     print(f"{e}\nStaying on OSC colors.")
                     return False
             self.bridge.frame_sync = True
-            self.framesync = FrameSync(self.ndi_src, self.devices, mode,
-                                       self.cfg.get("ndi_fps", 30), self.bridge,
-                                       debug=self.debug)
+            self.framesync = FrameSync(
+                self.ndi_src, self.devices, mode,
+                self.cfg.get("ndi_fps", 30), self.bridge, debug=self.debug,
+                fill_threshold=self.cfg.get("fill_threshold", 0.002))
             self.framesync.start()
             print(f"Color source: NDI/{mode}")
         else:
@@ -951,6 +1019,7 @@ class Controller:
             src = f"ndi/{self.framesync.mode}" if self.framesync else "osc"
             print(f"source={src}  bpm={self.bridge.bpm:.0f}  "
                   f"beat={'on' if self.bridge.beat_enabled else 'off'}  "
+                  f"fill={'on' if self.bridge.fill_enabled else 'off'}  "
                   f"idle={self.bridge.idle}")
             for d in self.devices:
                 print(f"  {d.name} ({d.ip}): global segs {d.global_segs}, "
@@ -972,6 +1041,23 @@ class Controller:
                 print(f"Beat flash {args[0]}")
             else:
                 print("usage: beat on|off")
+        elif cmd == "fill":
+            if args and args[0] in ("on", "off"):
+                self.bridge.fill_enabled = args[0] == "on"
+                self.cfg["fill_light"] = self.bridge.fill_enabled
+                save_config(self.cfg)
+                if not self.bridge.frame_sync:
+                    if self.bridge.fill_enabled:
+                        self.bridge._apply_fill_osc()
+                    else:
+                        # back to normal: resend the current color
+                        self.bridge.on_global_color("/output/color/hue",
+                                                    self.bridge.global_hsl["hue"])
+                print(f"Fill light {args[0]}"
+                      + (" (LEDs only while lasers are dark)"
+                         if args[0] == "on" else ""))
+            else:
+                print("usage: fill on|off")
         else:
             print("Unknown command. Type 'help'.")
         return False
@@ -1040,6 +1126,7 @@ def main():
 
     bridge = Bridge(cfg, devices, debug=args.debug)
     bridge.beat_enabled = bool(cfg.get("beat_flash", False))
+    bridge.fill_enabled = bool(cfg.get("fill_light", False))
     if restores:
         bridge.base_bri = restores[0][1].get("bri", 128)
 
@@ -1073,6 +1160,8 @@ def main():
               f"{d.global_segs}; {mapped or 'no group mappings'}")
     if bridge.beat_enabled:
         print("Beat flash is ON")
+    if bridge.fill_enabled:
+        print("Fill light is ON (LEDs only while lasers are dark)")
     print("Type 'help' for live commands (mode / beat / status / quit). "
           "Ctrl+C also quits"
           + (" (WLED state will be restored)." if restores else "."))

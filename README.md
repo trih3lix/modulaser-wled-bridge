@@ -17,6 +17,7 @@ Sync [WLED](https://kno.wled.ge/) LED devices to a [Modulaser](https://modulaser
 - **Live commands** — switch color source or NDI mapping while running (`mode osc`, `mode ndi gradient`), no restart needed
 - **Beat flash** — optional brightness pulses synced to Modulaser's BPM, works in every mode (`beat on|off`)
 - **Show-over watchdog** — when Modulaser goes quiet for N minutes, every device returns to normal lighting (startup state or a configured WLED preset)
+- **Fill-light mode** — inverts the relationship: LEDs stay dark while the lasers project (so they never wash out the beams) and come on with the last laser color when the lasers go dark (`fill on|off`)
 - **State restore** — on exit, every WLED device is put back exactly how it was found
 - **Auto-reconnect** — devices that drop offline are retried, and missed updates are re-queued
 
@@ -60,6 +61,7 @@ Pick your WLED device(s) and color source when prompted. Settings are remembered
 | `mode osc` | Follow OSC base color |
 | `mode ndi [gradient\|dominant\|zones]` | Sample NDI frames |
 | `beat on\|off` | BPM-synced brightness pulses |
+| `fill on\|off` | LEDs only while lasers are dark |
 | `status` | Current source, BPM, devices |
 | `quit` | Exit and restore WLED state |
 
@@ -80,7 +82,7 @@ devices:
 
 WLED effect IDs used for strobe/chase sync are configurable under `effects:`.
 
-Other keys: `beat_flash` / `beat_flash_depth` (beat pulse on/off and how deep it dips), `watchdog_minutes` (restore normal lighting after the show goes quiet; `0` disables), and per-device `idle_preset` (recall a WLED preset number instead of the startup snapshot when the watchdog fires).
+Other keys: `beat_flash` / `beat_flash_depth` (beat pulse on/off and how deep it dips), `watchdog_minutes` (restore normal lighting after the show goes quiet; `0` disables), per-device `idle_preset` (recall a WLED preset number instead of the startup snapshot when the watchdog fires), and `fill_light` / `fill_threshold` (fill-light mode; the threshold is the fraction of frame pixels that must be lit for the lasers to count as projecting — laser-darkness detection uses NDI frames, while in OSC mode fill keys off the blackout toggle).
 
 ## How it works
 
