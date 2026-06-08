@@ -144,31 +144,67 @@ def probe_wled(ip, timeout=0.5):
     return None
 
 
-def discover_mdns(seconds=4):
-    found = {}
+class MdnsDiscovery:
+    """Continuously discovers WLED devices over mDNS in the background.
 
-    class Listener:
-        def add_service(self, zc, type_, name):
-            info = zc.get_service_info(type_, name)
-            if info and info.addresses:
-                ip = socket.inet_ntoa(info.addresses[0])
-                found[ip] = probe_wled(ip, timeout=2) or {
-                    "ip": ip, "name": name.split(".")[0],
-                    "version": "?", "leds": "?"}
+    Probing happens off the Zeroconf callback thread so a slow device never
+    stalls discovery of the others. Call snapshot() any time for the devices
+    found so far; the browser keeps running until close()."""
 
-        def update_service(self, zc, type_, name):
-            pass
+    def __init__(self):
+        self._found = {}
+        self._lock = threading.Lock()
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+        self._zc = Zeroconf()
+        discovery = self
 
-        def remove_service(self, zc, type_, name):
-            pass
+        class Listener:
+            def add_service(self, zc, type_, name):
+                info = zc.get_service_info(type_, name, timeout=2000)
+                if info and info.addresses:
+                    ip = socket.inet_ntoa(info.addresses[0])
+                    fallback = {"ip": ip, "name": name.split(".")[0],
+                                "version": "?", "leds": "?"}
+                    discovery._record(ip, fallback)
+                    discovery._pool.submit(discovery._probe, ip, fallback)
 
-    zc = Zeroconf()
+            def update_service(self, zc, type_, name):
+                self.add_service(zc, type_, name)
+
+            def remove_service(self, zc, type_, name):
+                pass
+
+        self._browser = ServiceBrowser(self._zc, "_wled._tcp.local.", Listener())
+
+    def _record(self, ip, entry):
+        with self._lock:
+            # don't downgrade a fully-probed entry back to a fallback
+            if ip not in self._found or self._found[ip].get("version") == "?":
+                self._found[ip] = entry
+
+    def _probe(self, ip, fallback):
+        info = probe_wled(ip, timeout=2)
+        self._record(ip, info or fallback)
+
+    def snapshot(self):
+        with self._lock:
+            return {ip: dict(e) for ip, e in self._found.items()}
+
+    def close(self):
+        try:
+            self._zc.close()
+        finally:
+            self._pool.shutdown(wait=False)
+
+
+def discover_mdns(seconds=5):
+    """One-shot discovery (used by non-interactive paths)."""
+    d = MdnsDiscovery()
     try:
-        ServiceBrowser(zc, "_wled._tcp.local.", Listener())
         time.sleep(seconds)
+        return list(d.snapshot().values())
     finally:
-        zc.close()
-    return list(found.values())
+        d.close()
 
 
 def local_subnet():
@@ -192,52 +228,87 @@ def discover_subnet():
     return devices
 
 
-def select_devices(cfg):
-    """Scan, list all devices (discovered + remembered), let the user pick
-    one or more. Returns a list of IPs."""
-    print("Scanning for WLED devices via mDNS...")
-    discovered = {d["ip"]: d for d in discover_mdns()}
-
-    # include remembered devices that didn't announce themselves
+def _merge_remembered(discovered, cfg):
+    """Add remembered devices that haven't announced themselves yet."""
     for ip, entry in (cfg.get("devices") or {}).items():
         if ip not in discovered:
             discovered[ip] = probe_wled(ip, timeout=1) or {
                 "ip": ip, "name": entry.get("name", "WLED"),
                 "version": "?", "leds": "offline?"}
+    return discovered
 
-    if not discovered:
-        answer = input("No devices found. Sweep the local subnet? [Y/n] ")
-        if answer.strip().lower() not in ("n", "no"):
-            discovered = {d["ip"]: d for d in discover_subnet()}
 
-    if not discovered:
-        ip = input("No WLED devices found. Enter an IP manually: ").strip()
-        return [ip]
+def select_devices(cfg, initial_wait=5):
+    """Scan continuously, list devices, and let the user pick one or more.
 
-    devices = sorted(discovered.values(), key=lambda d: d["ip"])
-    last = [ip for ip in (cfg.get("selected") or []) if ip in discovered]
+    Discovery keeps running while the list is shown, so the catalog grows as
+    slower devices answer. Press 'r' to refresh, 's' to sweep the subnet.
+    Returns a list of IPs."""
+    print("Scanning for WLED devices via mDNS "
+          f"(listening {initial_wait}s; more may appear)...")
+    discovery = MdnsDiscovery()
+    try:
+        # Poll during the initial wait so an early-answering device shows up
+        # fast, but keep listening the full window for stragglers.
+        deadline = time.time() + initial_wait
+        while time.time() < deadline:
+            time.sleep(0.5)
+        last = cfg.get("selected") or []
 
-    print("\nAvailable WLED devices:")
-    for i, d in enumerate(devices, 1):
-        mark = "  (last used)" if d["ip"] in last else ""
-        print(f"  [{i}] {d['name']:<22} {d['ip']:<15} "
-              f"v{d['version']}  {d['leds']} LEDs{mark}")
+        def current():
+            d = _merge_remembered(discovery.snapshot(), cfg)
+            return sorted(d.values(), key=lambda x: x["ip"])
 
-    prompt = "\nSelect devices, e.g. 1 or 1,3 or 'a' for all"
-    prompt += " [Enter = last used]: " if last else ": "
-    while True:
-        raw = input(prompt).strip().lower()
-        if not raw and last:
-            return last
-        if raw == "a":
-            return [d["ip"] for d in devices]
-        try:
-            idxs = [int(t) for t in raw.replace(",", " ").split()]
-        except ValueError:
-            idxs = []
-        if idxs and all(1 <= i <= len(devices) for i in idxs):
-            return [devices[i - 1]["ip"] for i in idxs]
-        print("Invalid choice.")
+        while True:
+            devices = current()
+            if not devices:
+                answer = input("No devices found yet. [r]escan, [s]weep "
+                               "subnet, or enter an IP: ").strip().lower()
+                if answer in ("r", ""):
+                    time.sleep(3)
+                    continue
+                if answer == "s":
+                    for d in discover_subnet():
+                        discovery._record(d["ip"], d)
+                    continue
+                return [answer]
+
+            print("\nAvailable WLED devices:")
+            for i, d in enumerate(devices, 1):
+                mark = "  (last used)" if d["ip"] in last else ""
+                print(f"  [{i}] {d['name']:<22} {d['ip']:<15} "
+                      f"v{d['version']}  {d['leds']} LEDs{mark}")
+            print("  [r] rescan / refresh list    [s] sweep whole subnet")
+
+            prompt = "\nSelect devices, e.g. 1 or 1,3 or 'a' for all"
+            prompt += " [Enter = last used]: " if last else ": "
+            raw = input(prompt).strip().lower()
+            if raw == "r":
+                print("Still listening...")
+                time.sleep(3)
+                continue
+            if raw == "s":
+                print("Sweeping the subnet...")
+                for d in discover_subnet():
+                    discovery._record(d["ip"], d)
+                continue
+            if not raw and last:
+                kept = [ip for ip in last if ip in {d["ip"] for d in devices}]
+                if kept:
+                    return kept
+                print("Last-used device(s) not present; pick from the list.")
+                continue
+            if raw == "a":
+                return [d["ip"] for d in devices]
+            try:
+                idxs = [int(t) for t in raw.replace(",", " ").split()]
+            except ValueError:
+                idxs = []
+            if idxs and all(1 <= i <= len(devices) for i in idxs):
+                return [devices[i - 1]["ip"] for i in idxs]
+            print("Invalid choice. Use numbers, 'a', 'r', or 's'.")
+    finally:
+        discovery.close()
 
 
 def prompt_choice(title, options, last=None):

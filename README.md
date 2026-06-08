@@ -10,7 +10,7 @@ Sync [WLED](https://kno.wled.ge/) LED devices to a [Modulaser](https://modulaser
     - `gradient` — per-LED colors streamed over DDP; motion flows along the strip
     - `dominant` — the whole segment follows the frame's strongest color
     - `zones` — the frame is split into vertical zones, one per segment
-- **Network discovery** — finds WLED devices via mDNS (with subnet-sweep fallback) and prompts you to pick one or more at each start
+- **Network discovery** — continuously finds WLED devices via mDNS (with subnet-sweep fallback) and prompts you to pick one or more at each start; the list keeps growing while shown, with `r` to refresh and `s` to sweep the whole subnet
 - **Multi-device, multi-segment** — drive several WLED controllers at once, with per-device mappings from Modulaser output groups to WLED segments
 - **Strobe & chase sync** — enabling Modulaser's strobe/chase effects switches the mapped WLED segments to matching effects at a synced rate
 - **BPM sync** — Modulaser's tempo retimes running WLED effects
