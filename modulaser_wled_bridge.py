@@ -34,7 +34,15 @@ Config lives in wled_bridge.yaml next to this script. Per-device mappings:
         0: 0
         1: [1, 2]
 
-On exit (Ctrl+C) the script restores each WLED device to its prior state.
+While running, type commands to switch live (no restart needed):
+  mode osc | mode ndi [gradient|dominant|zones] | beat on|off | status | quit
+
+Extra config keys: beat_flash (BPM-synced brightness pulses),
+beat_flash_depth (how deep the pulse dips, 0-1), watchdog_minutes (restore
+normal lighting after the show goes quiet; 0 disables). Per-device
+idle_preset recalls a WLED preset number instead of the startup snapshot.
+
+On exit (Ctrl+C or 'quit') each WLED device is restored to its prior state.
 """
 
 import argparse
@@ -73,6 +81,9 @@ DEFAULT_CONFIG = {
     "ndi_mode": "gradient",
     "ndi_fps": 30,
     "ndi_source": None,
+    "beat_flash": False,
+    "beat_flash_depth": 0.5,
+    "watchdog_minutes": 10,
     "devices": {},
     "selected": [],
 }
@@ -535,7 +546,7 @@ class FrameSync(threading.Thread):
         self.interval = 1.0 / max(1, fps)
         self.bridge = bridge
         self.debug = debug
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self._next_log = 0.0
         self._ddp = {}
         if mode == "gradient":
@@ -543,15 +554,16 @@ class FrameSync(threading.Thread):
                          for d in devices}
 
     def stop(self):
-        self._stop.set()
+        self._stop_evt.set()
 
     def run(self):
         next_t = 0.0
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             frame = self.source.get_frame(timeout=0.5)
             if frame is None:
                 continue
             now = time.time()
+            self.bridge.last_activity = now
             if now < next_t:
                 continue
             next_t = now + self.interval
@@ -595,6 +607,7 @@ class Device:
         self.name = mapping.get("name", "WLED")
         self.client = client
         self.led_count = int(mapping.get("led_count", 30))
+        self.idle_preset = mapping.get("idle_preset")
         self.global_segs = [int(s) for s in
                             mapping.get("global_color_segments", [0])]
         groups = mapping.get("groups") or {}
@@ -620,6 +633,10 @@ class Bridge:
         self.bpm = 120.0
         self.blackout = False
         self.frame_sync = False    # True = NDI owns colors; OSC colors ignored
+        self.last_activity = time.time()
+        self.idle = False          # set by the watchdog when the show goes quiet
+        self.beat_enabled = False
+        self.base_bri = 128
 
     # -- helpers --
 
@@ -655,6 +672,7 @@ class Bridge:
     # -- OSC handlers --
 
     def on_global_color(self, address, *args):
+        self.last_activity = time.time()
         if not args:
             return
         key = self._canon_key(address.rsplit("/", 1)[-1])
@@ -662,6 +680,7 @@ class Bridge:
         with self.lock:
             if key == "level":
                 bri = max(1, round(value * 255))
+                self.base_bri = bri
                 for d in self.devices:
                     d.client.queue(top={"bri": bri})
                 return
@@ -673,6 +692,7 @@ class Bridge:
             client.queue(segment=seg, seg_fields={"col": [rgb]})
 
     def on_blackout(self, address, *args):
+        self.last_activity = time.time()
         if not args:
             return
         self.blackout = float(args[0]) >= 0.5
@@ -680,6 +700,7 @@ class Bridge:
             d.client.queue(top={"on": not self.blackout})
 
     def on_group_opacity(self, address, *args):
+        self.last_activity = time.time()
         if not args:
             return
         group = self._group_from(address)
@@ -695,6 +716,7 @@ class Bridge:
         regardless of how the slot is addressed; rate/enabled keys on the
         strobe and chase presets drive the matching WLED effect.
         """
+        self.last_activity = time.time()
         parts = address.split("/")
         if len(parts) < 6 or not args:
             return
@@ -744,6 +766,7 @@ class Bridge:
                 client.queue(segment=seg, seg_fields={"sx": sx})
 
     def on_bpm(self, address, *args):
+        self.last_activity = time.time()
         if not args or not self.cfg["bpm_sync"]:
             return
         value = float(args[0])
@@ -777,10 +800,181 @@ class Bridge:
         d.map("/group/*/opacity", self.on_group_opacity)
         d.map("/group/*/fx/*/*", self.on_group_fx)
         d.map("/bpm/value", self.on_bpm)
-        if self.debug:
-            d.set_default_handler(
-                lambda addr, *a: print(f"OSC (unmapped): {addr} {a}"))
+        def _unmapped(addr, *a):
+            self.last_activity = time.time()
+            if self.debug:
+                print(f"OSC (unmapped): {addr} {a}")
+
+        d.set_default_handler(_unmapped)
         return d
+
+
+class BeatFlash(threading.Thread):
+    """Beat-synced master brightness pulses derived from Modulaser's BPM."""
+
+    ATTACK = 0.12  # seconds the peak holds before dipping to the rest level
+
+    def __init__(self, bridge, devices, depth=0.5):
+        super().__init__(daemon=True)
+        self.bridge = bridge
+        self.devices = devices
+        self.depth = max(0.1, min(0.9, float(depth)))
+        self._stop_evt = threading.Event()
+        self._was_on = False
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def _set_bri(self, bri):
+        for d in self.devices:
+            d.client.queue(top={"bri": int(bri)})
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            active = self.bridge.beat_enabled and not self.bridge.idle
+            if not active:
+                if self._was_on:
+                    self._set_bri(self.bridge.base_bri)  # leave brightness clean
+                    self._was_on = False
+                time.sleep(0.2)
+                continue
+            self._was_on = True
+            period = 60.0 / max(20.0, min(300.0, self.bridge.bpm))
+            base = max(1, int(self.bridge.base_bri))
+            attack = min(self.ATTACK, period * 0.4)
+            self._set_bri(base)                              # beat hit
+            time.sleep(attack)
+            self._set_bri(max(1, round(base * (1.0 - self.depth))))
+            if self._stop_evt.wait(max(0.01, period - attack)):
+                break
+
+
+class Watchdog(threading.Thread):
+    """Restores normal lighting after the show goes quiet."""
+
+    def __init__(self, bridge, devices, cfg, restore_map, check_interval=2.0):
+        super().__init__(daemon=True)
+        self.bridge = bridge
+        self.devices = devices
+        self.cfg = cfg
+        self.restore_map = restore_map  # client -> startup snapshot
+        self.check_interval = check_interval
+        self._stop_evt = threading.Event()
+
+    def stop(self):
+        self._stop_evt.set()
+
+    def run(self):
+        while not self._stop_evt.wait(self.check_interval):
+            timeout = float(self.cfg.get("watchdog_minutes") or 0) * 60.0
+            if timeout <= 0:
+                continue
+            quiet = time.time() - self.bridge.last_activity
+            if self.bridge.idle:
+                if quiet < timeout:
+                    self.bridge.idle = False
+                    print("\n[watchdog] Modulaser is back; resuming.")
+            elif quiet >= timeout:
+                self.bridge.idle = True
+                print(f"\n[watchdog] No Modulaser activity for "
+                      f"{self.cfg['watchdog_minutes']} min; restoring lighting.")
+                for d in self.devices:
+                    if d.idle_preset is not None:
+                        d.client.post_state({"ps": int(d.idle_preset)})
+                    elif d.client in self.restore_map:
+                        d.client.post_state(self.restore_map[d.client])
+
+
+HELP_TEXT = """Live commands:
+  mode osc                            follow OSC base color
+  mode ndi [gradient|dominant|zones]  sample NDI frames
+  beat on|off                         beat-synced brightness pulses
+  status                              current source, BPM, devices
+  help                                this list
+  quit                                exit and restore WLED state"""
+
+
+class Controller:
+    """Runtime control: switch color sources and toggles without restarting."""
+
+    def __init__(self, cfg, bridge, devices, debug=False):
+        self.cfg = cfg
+        self.bridge = bridge
+        self.devices = devices
+        self.debug = debug
+        self.framesync = None
+        self.ndi_src = None
+
+    def set_source(self, source, mode=None):
+        mode = mode or self.cfg.get("ndi_mode") or "gradient"
+        if self.framesync:
+            self.framesync.stop()
+            self.framesync.join(timeout=2)
+            self.framesync = None
+        self.bridge.frame_sync = False
+        if source == "ndi":
+            if np is None:
+                print("numpy is not installed (pip install ndi-python numpy); "
+                      "staying on OSC colors.")
+                return False
+            if self.ndi_src is None:
+                try:
+                    self.ndi_src = NdiSource(preferred=self.cfg.get("ndi_source"))
+                    self.cfg["ndi_source"] = self.ndi_src.name
+                except RuntimeError as e:
+                    print(f"{e}\nStaying on OSC colors.")
+                    return False
+            self.bridge.frame_sync = True
+            self.framesync = FrameSync(self.ndi_src, self.devices, mode,
+                                       self.cfg.get("ndi_fps", 30), self.bridge,
+                                       debug=self.debug)
+            self.framesync.start()
+            print(f"Color source: NDI/{mode}")
+        else:
+            print("Color source: OSC base color")
+        self.cfg["color_source"] = source
+        self.cfg["ndi_mode"] = mode
+        save_config(self.cfg)
+        return True
+
+    def handle_command(self, line):
+        """Returns True when the app should quit."""
+        parts = line.split()
+        if not parts:
+            return False
+        cmd, args = parts[0], parts[1:]
+        if cmd in ("quit", "exit", "q"):
+            return True
+        if cmd == "help":
+            print(HELP_TEXT)
+        elif cmd == "status":
+            src = f"ndi/{self.framesync.mode}" if self.framesync else "osc"
+            print(f"source={src}  bpm={self.bridge.bpm:.0f}  "
+                  f"beat={'on' if self.bridge.beat_enabled else 'off'}  "
+                  f"idle={self.bridge.idle}")
+            for d in self.devices:
+                print(f"  {d.name} ({d.ip}): global segs {d.global_segs}, "
+                      f"{d.led_count} LEDs")
+        elif cmd == "mode":
+            if args and args[0] == "osc":
+                self.set_source("osc")
+            elif args and args[0] == "ndi" and (
+                    len(args) < 2
+                    or args[1] in ("gradient", "dominant", "zones")):
+                self.set_source("ndi", args[1] if len(args) > 1 else None)
+            else:
+                print("usage: mode osc | mode ndi [gradient|dominant|zones]")
+        elif cmd == "beat":
+            if args and args[0] in ("on", "off"):
+                self.bridge.beat_enabled = args[0] == "on"
+                self.cfg["beat_flash"] = self.bridge.beat_enabled
+                save_config(self.cfg)
+                print(f"Beat flash {args[0]}")
+            else:
+                print("usage: beat on|off")
+        else:
+            print("Unknown command. Type 'help'.")
+        return False
 
 
 # ---- Main ----------------------------------------------------------------------
@@ -845,27 +1039,22 @@ def main():
         devices.append(Device(ip, cfg["devices"][ip], client))
 
     bridge = Bridge(cfg, devices, debug=args.debug)
+    bridge.beat_enabled = bool(cfg.get("beat_flash", False))
+    if restores:
+        bridge.base_bri = restores[0][1].get("bri", 128)
 
-    framesync = None
+    controller = Controller(cfg, bridge, devices, debug=args.debug)
     if source == "ndi":
-        if np is None:
-            print("numpy is not installed (pip install numpy); "
-                  "falling back to OSC colors.")
-        else:
-            try:
-                ndi_src = NdiSource(preferred=cfg.get("ndi_source"))
-                cfg["ndi_source"] = ndi_src.name
-                save_config(cfg)
-                bridge.frame_sync = True
-                framesync = FrameSync(ndi_src, devices, mode,
-                                      cfg.get("ndi_fps", 30), bridge,
-                                      debug=args.debug)
-                framesync.start()
-            except RuntimeError as e:
-                print(f"{e}\nFalling back to OSC colors.")
+        controller.set_source("ndi", mode)
+
+    beat = BeatFlash(bridge, devices, depth=cfg.get("beat_flash_depth", 0.5))
+    beat.start()
+    watchdog = Watchdog(bridge, devices, cfg, dict(restores))
+    watchdog.start()
 
     server = BlockingOSCUDPServer(
         (cfg["listen_ip"], cfg["listen_port"]), bridge.build_dispatcher())
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
     try:
         SimpleUDPClient(cfg["modulaser_ip"],
@@ -875,24 +1064,39 @@ def main():
 
     print(f"\nBridging Modulaser ({cfg['listen_ip']}:{cfg['listen_port']}) "
           f"-> {len(devices)} WLED device(s)"
-          + (f", color source: NDI/{mode}" if framesync else
+          + (f", color source: NDI/{mode}" if controller.framesync else
              ", color source: OSC"))
     for d in devices:
         mapped = ", ".join(f"group {g} -> seg {s}"
                            for g, s in sorted(d.group_seg.items()))
         print(f"  {d.name} ({d.ip}): global color -> segments "
               f"{d.global_segs}; {mapped or 'no group mappings'}")
-    print("Ctrl+C to quit"
-          + (" (WLED state will be restored)" if restores else ""))
+    if bridge.beat_enabled:
+        print("Beat flash is ON")
+    print("Type 'help' for live commands (mode / beat / status / quit). "
+          "Ctrl+C also quits"
+          + (" (WLED state will be restored)." if restores else "."))
 
     try:
-        server.serve_forever()
+        while True:
+            try:
+                line = input("> ").strip().lower()
+            except EOFError:
+                # no interactive stdin (e.g. running as a service): idle here
+                time.sleep(1)
+                continue
+            if controller.handle_command(line):
+                break
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        pass
     finally:
-        if framesync:
-            framesync.stop()
-            framesync.source.close()
+        print("\nShutting down...")
+        beat.stop()
+        watchdog.stop()
+        if controller.framesync:
+            controller.framesync.stop()
+        if controller.ndi_src:
+            controller.ndi_src.close()
         for d in devices:
             d.client.stop()
         for client, snap in restores:

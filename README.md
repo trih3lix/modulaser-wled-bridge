@@ -14,6 +14,9 @@ Sync [WLED](https://kno.wled.ge/) LED devices to a [Modulaser](https://modulaser
 - **Multi-device, multi-segment** — drive several WLED controllers at once, with per-device mappings from Modulaser output groups to WLED segments
 - **Strobe & chase sync** — enabling Modulaser's strobe/chase effects switches the mapped WLED segments to matching effects at a synced rate
 - **BPM sync** — Modulaser's tempo retimes running WLED effects
+- **Live commands** — switch color source or NDI mapping while running (`mode osc`, `mode ndi gradient`), no restart needed
+- **Beat flash** — optional brightness pulses synced to Modulaser's BPM, works in every mode (`beat on|off`)
+- **Show-over watchdog** — when Modulaser goes quiet for N minutes, every device returns to normal lighting (startup state or a configured WLED preset)
 - **State restore** — on exit, every WLED device is put back exactly how it was found
 - **Auto-reconnect** — devices that drop offline are retried, and missed updates are re-queued
 
@@ -50,6 +53,16 @@ Pick your WLED device(s) and color source when prompted. Settings are remembered
 | `--mode gradient\|dominant\|zones` | Skip the NDI mapping prompt |
 | `--debug` | Print unhandled OSC messages and all WLED updates |
 
+### Live commands (while running)
+
+| Command | Effect |
+| ------- | ------ |
+| `mode osc` | Follow OSC base color |
+| `mode ndi [gradient\|dominant\|zones]` | Sample NDI frames |
+| `beat on\|off` | BPM-synced brightness pulses |
+| `status` | Current source, BPM, devices |
+| `quit` | Exit and restore WLED state |
+
 ## Configuration
 
 `wled_bridge.yaml` is created next to the script on first run. Per-device mappings:
@@ -66,6 +79,8 @@ devices:
 ```
 
 WLED effect IDs used for strobe/chase sync are configurable under `effects:`.
+
+Other keys: `beat_flash` / `beat_flash_depth` (beat pulse on/off and how deep it dips), `watchdog_minutes` (restore normal lighting after the show goes quiet; `0` disables), and per-device `idle_preset` (recall a WLED preset number instead of the startup snapshot when the watchdog fires).
 
 ## How it works
 
