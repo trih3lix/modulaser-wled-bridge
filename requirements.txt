@@ -1,7 +1,14 @@
-python-osc
-requests
-zeroconf
-pyyaml
-# Optional, for NDI frame sync mode:
-# ndi-python
-# numpy
+# Core runtime dependencies (OSC color source + mDNS discovery).
+# Pinned to compatible ranges so a future breaking release can't silently
+# break the bridge. See pyproject.toml for the packaged equivalents.
+python-osc>=1.8,<2
+requests>=2.28,<3
+zeroconf>=0.100,<1
+PyYAML>=6,<7
+
+# Optional, for NDI frame-sync mode. Installed via the [ndi] extra:
+#   pip install -e .[ndi]
+# ndi-python is sparsely maintained and lacks wheels for some Python
+# versions/platforms; if it won't install, use the OSC color source instead.
+# ndi-python>=5.1.1.5
+# numpy>=1.23
