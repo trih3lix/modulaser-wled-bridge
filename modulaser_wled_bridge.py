@@ -273,13 +273,16 @@ class MdnsDiscovery:
 
         class Listener:
             def add_service(self, zc, type_, name):
+                if discovery._closed:
+                    return
                 info = zc.get_service_info(type_, name, timeout=2000)
                 if info and info.addresses:
                     ip = socket.inet_ntoa(info.addresses[0])
                     fallback = {"ip": ip, "name": name.split(".")[0],
                                 "version": "?", "leds": "?"}
                     discovery._record(ip, fallback)
-                    discovery._pool.submit(discovery._probe, ip, fallback)
+                    if not discovery._closed:
+                        discovery._pool.submit(discovery._probe, ip, fallback)
 
             def update_service(self, zc, type_, name):
                 self.add_service(zc, type_, name)
@@ -295,7 +298,14 @@ class MdnsDiscovery:
             if ip not in self._found or self._found[ip].get("version") == "?":
                 self._found[ip] = entry
 
+    def add_manual(self, entry):
+        """Inject a device found outside mDNS (e.g. a subnet sweep) into the
+        catalog. Public replacement for reaching into _record."""
+        self._record(entry["ip"], entry)
+
     def _probe(self, ip, fallback):
+        if self._closed:
+            return
         info = probe_wled(ip, timeout=2)
         self._record(ip, info or fallback)
 
@@ -304,6 +314,9 @@ class MdnsDiscovery:
             return {ip: dict(e) for ip, e in self._found.items()}
 
     def close(self):
+        # Stop accepting new work first so no probe is submitted against a
+        # closing Zeroconf, then tear down the browser and the pool.
+        self._closed = True
         try:
             self._zc.close()
         finally:
@@ -399,7 +412,7 @@ def select_devices(cfg, initial_wait=5):
                     continue
                 if answer == "s":
                     for d in discover_subnet(cfg):
-                        discovery._record(d["ip"], d)
+                        discovery.add_manual(d)
                     continue
                 return [answer]
 
@@ -420,7 +433,7 @@ def select_devices(cfg, initial_wait=5):
             if raw == "s":
                 print("Sweeping the subnet...")
                 for d in discover_subnet(cfg):
-                    discovery._record(d["ip"], d)
+                    discovery.add_manual(d)
                 continue
             if not raw and last:
                 kept = [ip for ip in last if ip in {d["ip"] for d in devices}]
