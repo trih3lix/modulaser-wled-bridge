@@ -672,6 +672,9 @@ class NdiSource:
     def get_frame(self, timeout=0.5):
         """Return an (h, w, 3) RGB uint8 array, or None if no frame arrived."""
         ndi = self.ndi
+        if self.recv is None:
+            time.sleep(timeout)
+            return None
         t, v, _, _ = ndi.recv_capture_v2(self.recv, int(timeout * 1000))
         if t == ndi.FRAME_TYPE_VIDEO:
             data = np.copy(v.data)
@@ -679,6 +682,39 @@ class NdiSource:
             ndi.recv_free_video_v2(self.recv, v)
             return ndi_to_rgb(data, w, h)
         return None
+
+    def reconnect(self, timeout=5.0):
+        """Best-effort: tear down and re-open the receiver for the same source
+        name (handles Modulaser toggling its NDI output off/on). Returns True
+        once the receiver is reconnected."""
+        ndi = self.ndi
+        try:
+            if self.recv is not None:
+                ndi.recv_destroy(self.recv)
+        except Exception:
+            pass
+        self.recv = None
+        try:
+            find = ndi.find_create_v2()
+            deadline = time.time() + timeout
+            chosen = None
+            while time.time() < deadline and chosen is None:
+                ndi.find_wait_for_sources(find, 1000)
+                for s in ndi.find_get_current_sources(find):
+                    if s.ndi_name == self.name:
+                        chosen = s
+                        break
+            if chosen is None:
+                ndi.find_destroy(find)
+                return False
+            settings = ndi.RecvCreateV3()
+            settings.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
+            self.recv = ndi.recv_create_v3(settings)
+            ndi.recv_connect(self.recv, chosen)
+            ndi.find_destroy(find)
+            return True
+        except Exception:
+            return False
 
     def close(self):
         try:
@@ -714,13 +750,37 @@ class FrameSync(threading.Thread):
     def stop(self):
         self._stop_evt.set()
 
+    STALL_TIMEOUT = 3.0   # seconds without a frame before declaring source lost
+
     def run(self):
         next_t = 0.0
+        last_frame = time.time()
+        lost = False
+        next_reconnect = 0.0
+        reconnect_backoff = 2.0
         while not self._stop_evt.is_set():
             frame = self.source.get_frame(timeout=0.5)
-            if frame is None:
-                continue
             now = time.time()
+            if frame is None:
+                if not lost and now - last_frame > self.STALL_TIMEOUT:
+                    lost = True
+                    self.bridge.ndi_connected = False
+                    next_reconnect = now
+                    print("[NDI] source lost (no frames); reconnecting...")
+                if lost and now >= next_reconnect \
+                        and hasattr(self.source, "reconnect"):
+                    if self.source.reconnect():
+                        print("[NDI] receiver reconnected; awaiting frames.")
+                    else:
+                        reconnect_backoff = min(reconnect_backoff * 2, 30.0)
+                    next_reconnect = now + reconnect_backoff
+                continue
+            last_frame = now
+            if lost:
+                lost = False
+                reconnect_backoff = 2.0
+                print("[NDI] source recovered.")
+            self.bridge.ndi_connected = True
             self.bridge.last_activity = now
             if now < next_t:
                 continue
@@ -825,6 +885,7 @@ class Bridge:
         self.bpm = 120.0
         self.blackout = False
         self.frame_sync = False    # True = NDI owns colors; OSC colors ignored
+        self.ndi_connected = False  # True while NDI frames are arriving
         self.last_activity = time.time()
         self.idle = False          # set by the watchdog when the show goes quiet
         self.beat_enabled = False
@@ -1161,10 +1222,14 @@ class Controller:
             print(HELP_TEXT)
         elif cmd == "status":
             src = f"ndi/{self.framesync.mode}" if self.framesync else "osc"
+            ndi_state = ""
+            if self.framesync:
+                ndi_state = ("  ndi=connected" if self.bridge.ndi_connected
+                             else "  ndi=no-signal")
             print(f"source={src}  bpm={self.bridge.bpm:.0f}  "
                   f"beat={'on' if self.bridge.beat_enabled else 'off'}  "
                   f"fill={'on' if self.bridge.fill_enabled else 'off'}  "
-                  f"idle={self.bridge.idle}")
+                  f"idle={self.bridge.idle}{ndi_state}")
             for d in self.devices:
                 print(f"  {d.name} ({d.ip}): global segs {d.global_segs}, "
                       f"{d.led_count} LEDs")
