@@ -21,16 +21,35 @@ Sync [WLED](https://kno.wled.ge/) LED devices to a [Modulaser](https://modulaser
 - **State restore** — on exit, every WLED device is put back exactly how it was found
 - **Auto-reconnect** — devices that drop offline are retried, and missed updates are re-queued
 
+## Requirements
+
+- **Python 3.9+** (tested on 3.9, 3.11, 3.12).
+- **OS:** Linux, macOS, and Windows. mDNS discovery relies on `zeroconf`; if it
+  is unavailable the bridge still runs using configured/remembered device IPs.
+- **WLED:** any recent build with the JSON API and (for `gradient` mode) DDP
+  realtime enabled.
+- **NDI mode** additionally needs `ndi-python` + `numpy`. `ndi-python` is
+  sparsely maintained and lacks wheels for some Python versions/platforms; if
+  it will not install, use the OSC color source instead.
+
 ## Install
 
 ```
 pip install python-osc requests zeroconf pyyaml
 ```
 
-For NDI frame sync, additionally:
+For NDI frame sync, additionally (or use the packaged extra below):
 
 ```
 pip install ndi-python numpy
+```
+
+Or install from a checkout using the packaged metadata:
+
+```
+pip install .            # core
+pip install .[ndi]       # core + NDI frame sync
+pip install .[test]      # core + pytest/numpy for running the tests
 ```
 
 ## Setup
@@ -52,7 +71,11 @@ Pick your WLED device(s) and color source when prompted. Settings are remembered
 | `--auto` | Skip the device prompt, reuse the last selection |
 | `--source osc\|ndi` | Skip the color source prompt |
 | `--mode gradient\|dominant\|zones` | Skip the NDI mapping prompt |
-| `--debug` | Print unhandled OSC messages and all WLED updates |
+| `--debug` | Verbose logging: unhandled OSC and all WLED updates |
+| `--dry-run` | Log intended WLED/DDP writes instead of sending; no hardware or discovery needed (handy for demos/CI) |
+| `--headless` | Service mode: no interactive prompt, uses the saved selection and color source, runs until Ctrl+C/SIGTERM |
+| `--log-level debug\|info\|warning\|error` | Logging verbosity (default `info`) |
+| `--log-file PATH` | Also write logs to a file (for unattended shows) |
 
 ### Live commands (while running)
 
@@ -82,13 +105,60 @@ devices:
 
 WLED effect IDs used for strobe/chase sync are configurable under `effects:`.
 
-Other keys: `beat_flash` / `beat_flash_depth` (beat pulse on/off and how deep it dips), `watchdog_minutes` (restore normal lighting after the show goes quiet; `0` disables), per-device `idle_preset` (recall a WLED preset number instead of the startup snapshot when the watchdog fires), and `fill_light` / `fill_threshold` (fill-light mode; the threshold is the fraction of frame pixels that must be lit for the lasers to count as projecting — laser-darkness detection uses NDI frames, while in OSC mode fill keys off the blackout toggle).
+Other keys: `beat_flash` / `beat_flash_depth` (beat pulse on/off and how deep it dips), `watchdog_minutes` (restore normal lighting after the show goes quiet; `0` disables), per-device `idle_preset` (recall a WLED preset number instead of the startup snapshot when the watchdog fires), `fill_light` / `fill_threshold` (fill-light mode; the threshold is the fraction of frame pixels that must be lit for the lasers to count as projecting — laser-darkness detection uses NDI frames, while in OSC mode fill keys off the blackout toggle), and `sweep_cidr` (override the auto-detected subnet used by the `s` sweep, e.g. `192.168.1.0/24`, for multi-homed hosts or non-/24 LANs).
+
+Invalid values produce a clear `Config error in wled_bridge.yaml: <key>: ...` message naming the offending key rather than a traceback.
+
+## Ports
+
+| Port | Protocol | Direction | Purpose |
+| ---- | -------- | --------- | ------- |
+| `9000/udp` | OSC | Modulaser → bridge | Color/effect/BPM feedback (`listen_port`) |
+| `8000/udp` | OSC | bridge → Modulaser | One `/refresh` on start (`modulaser_osc_in_port`) |
+| `80/tcp` | HTTP | bridge → WLED | JSON state API (`/json/state`, `/json/info`) |
+| `4048/udp` | DDP | bridge → WLED | Realtime per-LED streaming (gradient mode) |
+| `5353/udp` | mDNS | both | WLED device discovery |
+
+Make sure your firewall allows inbound `9000/udp` on the machine running the
+bridge and outbound HTTP/DDP/mDNS to the LED devices.
+
+## Troubleshooting
+
+- **No devices found:** press `s` to sweep the subnet, or type a device IP
+  directly. On a multi-homed host or a non-/24 LAN set `sweep_cidr` in
+  `wled_bridge.yaml`. You can also add devices under `devices:` and run with
+  `--auto`/`--headless` to skip discovery entirely.
+- **NDI source not appearing:** enable **NDI output** in Modulaser's output
+  settings; the bridge logs `NDI source lost … reconnecting` and retries with
+  backoff when a source drops. `status` shows `ndi=connected`/`no-signal`.
+- **`ndi-python` won't install:** it lacks wheels on some Python
+  versions/platforms — use the OSC color source, which needs no extra deps.
+- **Wrong LED count / truncated gradient:** set `led_count` to match the
+  strip; a mismatch logs a one-time DDP warning and is clipped/padded to fit.
+- **Firewall / no updates:** confirm inbound `9000/udp` is open and the LED
+  devices are reachable over HTTP (`80`) and DDP (`4048`).
+- **Try it without hardware:** `--dry-run` logs every intended write so you
+  can validate mappings and OSC wiring before a show.
 
 ## How it works
 
 Modulaser sends OSC feedback for every parameter change. The bridge listens on UDP, maps color/effect/BPM addresses onto WLED's JSON API (debounced, ~20 Hz), and in NDI mode receives rendered frames, samples them with numpy (ignoring the black background), and streams per-LED colors over DDP at up to 30 fps.
 
 OSC feedback only carries *parameter* values, so colors computed inside Modulaser's node graph (gradients, per-point animation) are invisible to OSC — that's exactly what NDI frame sync is for.
+
+## Development
+
+Run the test suite (pure-logic unit tests: color math, NDI normalization,
+sampling, DDP framing, OSC mapping, config validation, client debounce). No
+hardware or NDI runtime required:
+
+```
+pip install .[test]
+pytest
+```
+
+CI runs `py_compile` + `pytest` on Python 3.9/3.11/3.12 (see
+`.github/workflows/ci.yml`).
 
 ## License
 
