@@ -345,6 +345,7 @@ class WledClient:
         self._online = True
         self._shutting_down = False
         self._backoff = 0.0
+        self._session = requests.Session()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -360,6 +361,11 @@ class WledClient:
         self._stop.set()
         self._dirty.set()
         self._thread.join(timeout=3)
+
+    def close(self):
+        """Release the pooled HTTP connections. Call after any final
+        post_state (e.g. the shutdown restore) has been sent."""
+        self._session.close()
 
     def queue(self, top=None, segment=None, seg_fields=None):
         with self._lock:
@@ -411,8 +417,8 @@ class WledClient:
         try:
             if self.debug:
                 print(f"-> WLED {self.ip}: {payload}")
-            requests.post(f"http://{self.ip}/json/state", json=payload,
-                          timeout=timeout)
+            self._session.post(f"http://{self.ip}/json/state", json=payload,
+                               timeout=timeout)
             with self._lock:
                 self._backoff = 0.0
                 if not self._online:
@@ -445,8 +451,8 @@ class WledClient:
 
     def get_state(self, timeout=2):
         try:
-            return requests.get(f"http://{self.ip}/json/state",
-                                timeout=timeout).json()
+            return self._session.get(f"http://{self.ip}/json/state",
+                                     timeout=timeout).json()
         except (requests.RequestException, ValueError) as e:
             print(f"Could not read WLED {self.ip} state: {e}")
             return None
@@ -1303,6 +1309,8 @@ def main():
         for client, snap in restores:
             print(f"Restoring {client.ip}...")
             client.post_state(snap, timeout=3)
+        for d in devices:
+            d.client.close()
 
 
 if __name__ == "__main__":
