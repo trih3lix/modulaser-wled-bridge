@@ -476,9 +476,10 @@ def prompt_choice(title, options, last=None):
 class WledClient:
     """Debounced, auto-reconnecting WLED JSON API client."""
 
-    def __init__(self, ip, max_rate_hz, debug=False):
+    def __init__(self, ip, max_rate_hz, debug=False, dry_run=False):
         self.ip = ip
         self.debug = debug
+        self.dry_run = dry_run
         self.min_interval = 1.0 / max_rate_hz
         self._pending = {}
         self._raw = []                # one-shot full payloads (restore/preset)
@@ -557,6 +558,11 @@ class WledClient:
             time.sleep(self.min_interval)
 
     def post_state(self, payload, timeout=1):
+        if self.dry_run:
+            print(f"[dry-run] WLED {self.ip} <- {payload}")
+            with self._lock:
+                self._online = True
+            return
         try:
             if self.debug:
                 print(f"-> WLED {self.ip}: {payload}")
@@ -593,6 +599,8 @@ class WledClient:
             self._stop.wait(backoff)
 
     def get_state(self, timeout=2):
+        if self.dry_run:
+            return None
         try:
             return self._session.get(f"http://{self.ip}/json/state",
                                      timeout=timeout).json()
@@ -623,12 +631,15 @@ class DdpSender:
 
     MAX_DATA = 1440  # payload bytes per packet (multiple of 3)
 
-    def __init__(self, host, port=4048):
+    def __init__(self, host, port=4048, dry_run=False):
         self.addr = (host, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.dry_run = dry_run
+        self.sock = None if dry_run else socket.socket(socket.AF_INET,
+                                                       socket.SOCK_DGRAM)
         self.seq = 0
         self._warned_len = False
         self._send_failed = False
+        self._next_log = 0.0
 
     def _fit(self, data, led_count):
         """Clip/pad data to led_count*3 bytes, warning once on a mismatch
@@ -653,6 +664,14 @@ class DdpSender:
         frame thread stays alive."""
         data = self._fit(data, led_count)
         self.seq = self.seq % 15 + 1
+        if self.dry_run:
+            now = time.time()
+            if now >= self._next_log:
+                self._next_log = now + 2.0
+                head = list(data[:9])
+                print(f"[dry-run] DDP {self.addr[0]} <- {len(data)} bytes "
+                      f"({len(data) // 3} LEDs), first={head}")
+            return True
         offset = 0
         try:
             while True:
@@ -871,7 +890,8 @@ class FrameSync(threading.Thread):
     """Pulls frames from a source and pushes sampled colors to the devices."""
 
     def __init__(self, frame_source, devices, mode, fps, bridge,
-                 ddp_port=4048, debug=False, fill_threshold=0.002):
+                 ddp_port=4048, debug=False, fill_threshold=0.002,
+                 dry_run=False):
         super().__init__(daemon=True)
         self.source = frame_source
         self.devices = devices
@@ -887,7 +907,8 @@ class FrameSync(threading.Thread):
         self._next_log = 0.0
         self._ddp = {}
         if mode == "gradient":
-            self._ddp = {d.ip: DdpSender(d.ip.split(":")[0], ddp_port)
+            self._ddp = {d.ip: DdpSender(d.ip.split(":")[0], ddp_port,
+                                         dry_run=dry_run)
                          for d in devices}
 
     def stop(self):
@@ -1311,11 +1332,12 @@ HELP_TEXT = """Live commands:
 class Controller:
     """Runtime control: switch color sources and toggles without restarting."""
 
-    def __init__(self, cfg, bridge, devices, debug=False):
+    def __init__(self, cfg, bridge, devices, debug=False, dry_run=False):
         self.cfg = cfg
         self.bridge = bridge
         self.devices = devices
         self.debug = debug
+        self.dry_run = dry_run
         self.framesync = None
         self.ndi_src = None
 
@@ -1342,7 +1364,8 @@ class Controller:
             self.framesync = FrameSync(
                 self.ndi_src, self.devices, mode,
                 self.cfg.get("ndi_fps", 30), self.bridge, debug=self.debug,
-                fill_threshold=self.cfg.get("fill_threshold", 0.002))
+                fill_threshold=self.cfg.get("fill_threshold", 0.002),
+                dry_run=self.dry_run)
             self.framesync.start()
             print(f"Color source: NDI/{mode}")
         else:
@@ -1426,6 +1449,9 @@ def main():
                         help="NDI frame mapping (skips the prompt)")
     parser.add_argument("--debug", action="store_true",
                         help="print unhandled OSC messages and all WLED updates")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="log intended WLED/DDP writes instead of sending; "
+                             "no hardware or discovery needed")
     args = parser.parse_args()
 
     try:
@@ -1434,7 +1460,10 @@ def main():
         print(f"Config error in {CONFIG_PATH.name}: {e}")
         raise SystemExit(2)
 
-    if args.auto and cfg.get("selected"):
+    if args.dry_run:
+        ips = cfg.get("selected") or ["127.0.0.1"]
+        print(f"--dry-run: no hardware; simulating device(s): {', '.join(ips)}")
+    elif args.auto and cfg.get("selected"):
         ips = cfg["selected"]
         print(f"--auto: using last selection: {', '.join(ips)}")
     else:
@@ -1457,7 +1486,7 @@ def main():
     # ensure every selected device has a mapping entry, then remember choices
     for ip in ips:
         entry = cfg["devices"].setdefault(ip, {})
-        info = probe_wled(ip, timeout=1)
+        info = None if args.dry_run else probe_wled(ip, timeout=1)
         entry.setdefault("name", (info or {}).get("name", "WLED"))
         if info and isinstance(info.get("leds"), int):
             entry.setdefault("led_count", info["leds"])
@@ -1471,7 +1500,8 @@ def main():
 
     devices, restores = [], []
     for ip in ips:
-        client = WledClient(ip, cfg["max_rate_hz"], debug=args.debug)
+        client = WledClient(ip, cfg["max_rate_hz"], debug=args.debug,
+                            dry_run=args.dry_run)
         if cfg["restore_on_exit"]:
             snap = snapshot_for_restore(client.get_state())
             if snap:
@@ -1485,7 +1515,8 @@ def main():
     if restores:
         bridge.base_bri = restores[0][1].get("bri", 128)
 
-    controller = Controller(cfg, bridge, devices, debug=args.debug)
+    controller = Controller(cfg, bridge, devices, debug=args.debug,
+                            dry_run=args.dry_run)
     if source == "ndi":
         controller.set_source("ndi", mode)
 
