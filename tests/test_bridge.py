@@ -252,6 +252,48 @@ def test_load_config_migrates_v2_single_device(tmp_path, monkeypatch):
     assert cfg["selected"] == ["192.168.0.42"]
 
 
+def _write_cfg(tmp_path, monkeypatch, text):
+    p = tmp_path / "wled_bridge.yaml"
+    p.write_text(text)
+    monkeypatch.setattr(mb, "CONFIG_PATH", p)
+
+
+def test_validate_bad_led_count_names_key(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch,
+               "devices:\n  192.168.0.5:\n    led_count: not-a-number\n")
+    with pytest.raises(mb.ConfigError) as ei:
+        mb.load_config()
+    assert "devices.192.168.0.5.led_count" in str(ei.value)
+
+
+def test_validate_non_dict_devices(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch, "devices: [1, 2, 3]\n")
+    with pytest.raises(mb.ConfigError) as ei:
+        mb.load_config()
+    assert "devices" in str(ei.value)
+
+
+def test_validate_bad_effect_type(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch, "effects:\n  strobe: fast\n")
+    with pytest.raises(mb.ConfigError) as ei:
+        mb.load_config()
+    assert "effects.strobe" in str(ei.value)
+
+
+def test_validate_bad_color_source(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch, "color_source: laser\n")
+    with pytest.raises(mb.ConfigError):
+        mb.load_config()
+
+
+def test_validate_groups_must_be_mapping(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch,
+               "devices:\n  10.0.0.1:\n    groups: [0, 1]\n")
+    with pytest.raises(mb.ConfigError) as ei:
+        mb.load_config()
+    assert "groups" in str(ei.value)
+
+
 def test_load_config_merges_partial_effects(tmp_path, monkeypatch):
     p = tmp_path / "wled_bridge.yaml"
     p.write_text("effects:\n  strobe: 99\n")

@@ -127,11 +127,88 @@ def osc_to_bpm(value):
 
 # ---- Config ------------------------------------------------------------------
 
+class ConfigError(Exception):
+    """Raised for an invalid wled_bridge.yaml with an operator-friendly message."""
+
+
+def _as_int(value, key):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{key}: expected a whole number, got {value!r}")
+
+
+def _as_number(value, key):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{key}: expected a number, got {value!r}")
+
+
+def validate_config(cfg):
+    """Type-check and coerce known keys, raising ConfigError with the offending
+    key named so a YAML typo produces a clear message, not a deep traceback."""
+    cfg["listen_port"] = _as_int(cfg["listen_port"], "listen_port")
+    cfg["modulaser_osc_in_port"] = _as_int(
+        cfg["modulaser_osc_in_port"], "modulaser_osc_in_port")
+    cfg["max_rate_hz"] = _as_number(cfg["max_rate_hz"], "max_rate_hz")
+    if cfg["max_rate_hz"] <= 0:
+        raise ConfigError("max_rate_hz: must be greater than 0")
+    cfg["ndi_fps"] = _as_number(cfg["ndi_fps"], "ndi_fps")
+    cfg["watchdog_minutes"] = _as_number(
+        cfg.get("watchdog_minutes") or 0, "watchdog_minutes")
+    cfg["fill_threshold"] = _as_number(cfg["fill_threshold"], "fill_threshold")
+
+    if cfg["color_source"] not in ("osc", "ndi"):
+        raise ConfigError(
+            f"color_source: must be 'osc' or 'ndi', got {cfg['color_source']!r}")
+    if cfg["ndi_mode"] not in ("gradient", "dominant", "zones"):
+        raise ConfigError(
+            "ndi_mode: must be gradient/dominant/zones, "
+            f"got {cfg['ndi_mode']!r}")
+
+    if not isinstance(cfg.get("effects"), dict):
+        raise ConfigError("effects: must be a mapping of name -> effect id")
+    for name in ("solid", "strobe", "chase"):
+        if name not in cfg["effects"]:
+            raise ConfigError(f"effects.{name}: missing required effect id")
+        cfg["effects"][name] = _as_int(cfg["effects"][name], f"effects.{name}")
+
+    devices = cfg.get("devices")
+    if not isinstance(devices, dict):
+        raise ConfigError("devices: must be a mapping of ip -> settings")
+    for ip, mapping in devices.items():
+        if not isinstance(mapping, dict):
+            raise ConfigError(f"devices.{ip}: must be a mapping of settings")
+        if "led_count" in mapping:
+            mapping["led_count"] = _as_int(
+                mapping["led_count"], f"devices.{ip}.led_count")
+        segs = mapping.get("global_color_segments", [])
+        if not isinstance(segs, list):
+            raise ConfigError(
+                f"devices.{ip}.global_color_segments: must be a list of "
+                f"segment ids, got {segs!r}")
+        groups = mapping.get("groups")
+        if groups is not None and not isinstance(groups, dict):
+            raise ConfigError(
+                f"devices.{ip}.groups: must be a mapping of group -> "
+                f"segment(s), got {groups!r}")
+    if not isinstance(cfg.get("selected"), list):
+        raise ConfigError("selected: must be a list of device IPs")
+    return cfg
+
+
 def load_config():
     user = {}
     if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
-            user = yaml.safe_load(f) or {}
+        try:
+            with open(CONFIG_PATH) as f:
+                user = yaml.safe_load(f) or {}
+        except yaml.YAMLError as e:
+            raise ConfigError(f"could not parse {CONFIG_PATH.name}: {e}")
+        if not isinstance(user, dict):
+            raise ConfigError(
+                f"{CONFIG_PATH.name}: top level must be a mapping of settings")
     # migrate v2 single-device config
     if user.get("wled_ip"):
         ip = user.pop("wled_ip")
@@ -144,7 +221,7 @@ def load_config():
         user.setdefault("selected", [ip])
     cfg = {**DEFAULT_CONFIG, **user}
     cfg["effects"] = {**DEFAULT_CONFIG["effects"], **(user.get("effects") or {})}
-    return cfg
+    return validate_config(cfg)
 
 
 def save_config(cfg):
@@ -1315,7 +1392,11 @@ def main():
                         help="print unhandled OSC messages and all WLED updates")
     args = parser.parse_args()
 
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"Config error in {CONFIG_PATH.name}: {e}")
+        raise SystemExit(2)
 
     if args.auto and cfg.get("selected"):
         ips = cfg["selected"]
