@@ -484,22 +484,54 @@ class DdpSender:
         self.addr = (host, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq = 0
+        self._warned_len = False
+        self._send_failed = False
 
-    def send(self, data):
-        """data: raw RGB bytes (3 per LED)."""
+    def _fit(self, data, led_count):
+        """Clip/pad data to led_count*3 bytes, warning once on a mismatch
+        (usually a wrong led_count in config vs the real strip length)."""
+        if led_count is None:
+            return data
+        expected = led_count * 3
+        if len(data) == expected:
+            return data
+        if not self._warned_len:
+            print(f"DDP {self.addr[0]}: got {len(data)} bytes, expected "
+                  f"{expected} ({led_count} LEDs); check led_count. "
+                  "Clipping/padding to fit.")
+            self._warned_len = True
+        if len(data) > expected:
+            return data[:expected]
+        return data + b"\x00" * (expected - len(data))
+
+    def send(self, data, led_count=None):
+        """data: raw RGB bytes (3 per LED). Returns True on success.
+        A transient socket error is logged once and swallowed so the caller's
+        frame thread stays alive."""
+        data = self._fit(data, led_count)
         self.seq = self.seq % 15 + 1
         offset = 0
-        while True:
-            chunk = data[offset:offset + self.MAX_DATA]
-            last = offset + len(chunk) >= len(data)
-            flags = 0x40 | (0x01 if last else 0x00)  # ver 1 | push on final
-            header = (bytes([flags, self.seq, 0x01, 0x01])
-                      + offset.to_bytes(4, "big")
-                      + len(chunk).to_bytes(2, "big"))
-            self.sock.sendto(header + chunk, self.addr)
-            offset += len(chunk)
-            if last:
-                break
+        try:
+            while True:
+                chunk = data[offset:offset + self.MAX_DATA]
+                last = offset + len(chunk) >= len(data)
+                flags = 0x40 | (0x01 if last else 0x00)  # ver 1 | push on final
+                header = (bytes([flags, self.seq, 0x01, 0x01])
+                          + offset.to_bytes(4, "big")
+                          + len(chunk).to_bytes(2, "big"))
+                self.sock.sendto(header + chunk, self.addr)
+                offset += len(chunk)
+                if last:
+                    break
+        except OSError as e:
+            if not self._send_failed:
+                print(f"DDP {self.addr[0]} send failed ({e}); will keep trying.")
+                self._send_failed = True
+            return False
+        if self._send_failed:
+            print(f"DDP {self.addr[0]} send recovered.")
+            self._send_failed = False
+        return True
 
 
 # ---- Frame sampling --------------------------------------------------------------
@@ -710,7 +742,7 @@ class FrameSync(threading.Thread):
                         colors = np.zeros((d.led_count, 3), dtype=np.uint8)
                     else:
                         colors = sample_gradient(frame, d.led_count)
-                    self._ddp[d.ip].send(colors.tobytes())
+                    self._ddp[d.ip].send(colors.tobytes(), d.led_count)
                 elif self.mode == "dominant":
                     rgb = ([0, 0, 0] if frame is None
                            else [int(c) for c in sample_dominant(frame)])
@@ -750,7 +782,7 @@ class FrameSync(threading.Thread):
                 # DDP realtime times out if we stop streaming, so always send
                 colors = np.tile(np.array(out, dtype=np.uint8),
                                  (d.led_count, 1))
-                self._ddp[d.ip].send(colors.tobytes())
+                self._ddp[d.ip].send(colors.tobytes(), d.led_count)
             elif changed:
                 for seg in d.global_segs:
                     d.client.queue(segment=seg,
