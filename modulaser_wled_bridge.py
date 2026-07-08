@@ -338,22 +338,32 @@ class WledClient:
         self.debug = debug
         self.min_interval = 1.0 / max_rate_hz
         self._pending = {}
+        self._raw = []                # one-shot full payloads (restore/preset)
         self._lock = threading.Lock()
         self._dirty = threading.Event()
         self._stop = threading.Event()
         self._online = True
+        self._shutting_down = False
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self._thread.start()
 
+    def begin_shutdown(self):
+        """Freeze the pending queue so no in-flight color updates can clobber
+        the final restore. Safe to call from any thread."""
+        with self._lock:
+            self._shutting_down = True
+
     def stop(self):
         self._stop.set()
         self._dirty.set()
-        self._thread.join(timeout=2)
+        self._thread.join(timeout=3)
 
     def queue(self, top=None, segment=None, seg_fields=None):
         with self._lock:
+            if self._shutting_down:
+                return
             if top:
                 self._pending.update(top)
             if segment is not None and seg_fields:
@@ -361,15 +371,27 @@ class WledClient:
                 segs.setdefault(segment, {}).update(seg_fields)
         self._dirty.set()
 
-    def _take_pending(self):
+    def queue_raw(self, payload):
+        """Enqueue a one-shot full payload (restore snapshot / preset recall)
+        to be sent as-is by the worker thread. Keeps the owning worker the
+        sole caller of post_state so no other thread touches the socket."""
         with self._lock:
+            if self._shutting_down:
+                return
+            self._raw.append(dict(payload))
+        self._dirty.set()
+
+    def _take_pending(self):
+        """Return (raw_payloads, merged_pending_or_None) and clear the queues."""
+        with self._lock:
+            raws, self._raw = self._raw, []
             if not self._pending:
-                return None
+                return raws, None
             pending, self._pending = self._pending, {}
         segs = pending.pop("seg", None)
         if segs:
             pending["seg"] = [{"id": sid, **fields} for sid, fields in segs.items()]
-        return pending
+        return raws, pending
 
     def _run(self):
         while not self._stop.is_set():
@@ -377,7 +399,9 @@ class WledClient:
             if self._stop.is_set():
                 break
             self._dirty.clear()
-            payload = self._take_pending()
+            raws, payload = self._take_pending()
+            for raw in raws:
+                self.post_state(raw)
             if payload:
                 self.post_state(payload)
             time.sleep(self.min_interval)
@@ -388,14 +412,19 @@ class WledClient:
                 print(f"-> WLED {self.ip}: {payload}")
             requests.post(f"http://{self.ip}/json/state", json=payload,
                           timeout=timeout)
-            if not self._online:
-                print(f"WLED {self.ip} back online.")
-                self._online = True
-        except requests.RequestException as e:
-            if self._online:
-                print(f"WLED {self.ip} unreachable ({e}); will keep retrying.")
-                self._online = False
             with self._lock:
+                if not self._online:
+                    print(f"WLED {self.ip} back online.")
+                    self._online = True
+        except requests.RequestException as e:
+            with self._lock:
+                if self._online:
+                    print(f"WLED {self.ip} unreachable ({e}); will keep retrying.")
+                    self._online = False
+                if self._shutting_down:
+                    # Don't requeue during shutdown: the frozen queue must not
+                    # be repopulated behind the final restore.
+                    return
                 segs = {s["id"]: {k: v for k, v in s.items() if k != "id"}
                         for s in payload.pop("seg", [])}
                 merged = dict(payload)
@@ -1017,9 +1046,9 @@ class Watchdog(threading.Thread):
                       f"{self.cfg['watchdog_minutes']} min; restoring lighting.")
                 for d in self.devices:
                     if d.idle_preset is not None:
-                        d.client.post_state({"ps": int(d.idle_preset)})
+                        d.client.queue_raw({"ps": int(d.idle_preset)})
                     elif d.client in self.restore_map:
-                        d.client.post_state(self.restore_map[d.client])
+                        d.client.queue_raw(self.restore_map[d.client])
 
 
 HELP_TEXT = """Live commands:
@@ -1257,6 +1286,12 @@ def main():
             controller.framesync.stop()
         if controller.ndi_src:
             controller.ndi_src.close()
+        # Freeze every device's pending queue first so no late color update can
+        # slip in behind the restore, then stop the worker threads. After the
+        # workers have joined, the main thread is the sole caller of post_state,
+        # so the restore writes are race-free.
+        for d in devices:
+            d.client.begin_shutdown()
         for d in devices:
             d.client.stop()
         for client, snap in restores:
