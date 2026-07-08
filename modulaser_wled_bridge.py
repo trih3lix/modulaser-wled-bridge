@@ -100,6 +100,23 @@ DEFAULT_CONFIG = {
 
 DEFAULT_DEVICE_MAPPING = {"global_color_segments": [0], "groups": {0: 0}}
 
+# BPM range the bridge maps onto WLED's 0-255 effect-speed (sx) byte.
+BPM_MIN, BPM_MAX = 20.0, 300.0
+
+
+def bpm_to_sx(bpm):
+    """Map a BPM (BPM_MIN..BPM_MAX) to a WLED effect-speed byte (0..255)."""
+    span = BPM_MAX - BPM_MIN
+    return round(max(0.0, min(1.0, (bpm - BPM_MIN) / span)) * 255)
+
+
+def osc_to_bpm(value):
+    """Interpret Modulaser's OSC BPM feedback: a 0..1 value is normalized into
+    BPM_MIN..BPM_MAX; a value > 1 is treated as an absolute BPM."""
+    if value <= 1.0:
+        return BPM_MIN + value * (BPM_MAX - BPM_MIN)
+    return float(value)
+
 
 # ---- Config ------------------------------------------------------------------
 
@@ -921,7 +938,7 @@ class Bridge:
                 yield d.client, seg
 
     def _bpm_sx(self):
-        return round(max(0.0, min(1.0, (self.bpm - 20.0) / 280.0)) * 255)
+        return bpm_to_sx(self.bpm)
 
     # -- OSC handlers --
 
@@ -1040,8 +1057,7 @@ class Bridge:
         self.last_activity = time.time()
         if not args or not self.cfg["bpm_sync"]:
             return
-        value = float(args[0])
-        bpm = 20.0 + value * 280.0 if value <= 1.0 else value
+        bpm = osc_to_bpm(float(args[0]))
         with self.lock:
             self.bpm = bpm
             sx = self._bpm_sx()
@@ -1110,7 +1126,7 @@ class BeatFlash(threading.Thread):
                 time.sleep(0.2)
                 continue
             self._was_on = True
-            period = 60.0 / max(20.0, min(300.0, self.bridge.bpm))
+            period = 60.0 / max(BPM_MIN, min(BPM_MAX, self.bridge.bpm))
             base = max(1, int(self.bridge.base_bri))
             attack = min(self.ATTACK, period * 0.4)
             self._set_bri(base)                              # beat hit
