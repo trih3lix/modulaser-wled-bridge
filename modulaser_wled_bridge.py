@@ -67,12 +67,19 @@ import yaml
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import BlockingOSCUDPServer
 from pythonosc.udp_client import SimpleUDPClient
-from zeroconf import ServiceBrowser, Zeroconf
 
 try:
     import numpy as np
 except ImportError:
     np = None
+
+try:
+    from zeroconf import ServiceBrowser, Zeroconf
+except ImportError:  # pragma: no cover - optional at import time
+    # mDNS discovery is unavailable (e.g. zeroconf not installed / failed to
+    # load). The app still runs with configured/remembered device IPs; only
+    # the auto-discovery UI is affected.
+    ServiceBrowser = Zeroconf = None
 
 CONFIG_PATH = Path(__file__).with_name("wled_bridge.yaml")
 
@@ -169,8 +176,14 @@ class MdnsDiscovery:
     found so far; the browser keeps running until close()."""
 
     def __init__(self):
+        if Zeroconf is None:
+            raise RuntimeError(
+                "mDNS discovery needs the 'zeroconf' package (pip install "
+                "zeroconf), or it failed to load. Enter a device IP manually "
+                "or list devices under 'devices:' in wled_bridge.yaml.")
         self._found = {}
         self._lock = threading.Lock()
+        self._closed = False
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
         self._zc = Zeroconf()
         discovery = self
