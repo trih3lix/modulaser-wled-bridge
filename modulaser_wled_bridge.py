@@ -57,7 +57,10 @@ import argparse
 import colorsys
 import concurrent.futures
 import ipaddress
+import logging
+import signal
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -82,6 +85,21 @@ except ImportError:  # pragma: no cover - optional at import time
     ServiceBrowser = Zeroconf = None
 
 CONFIG_PATH = Path(__file__).with_name("wled_bridge.yaml")
+
+# Operational/background messages go through this logger (unattended shows get
+# a timestamped trace); interactive prompts and menus stay on plain print().
+log = logging.getLogger("modulaser_wled_bridge")
+
+
+def setup_logging(level="info", log_file=None):
+    lvl = getattr(logging, str(level).upper(), logging.INFO)
+    handlers = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    logging.basicConfig(
+        level=lvl, handlers=handlers,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S")
 
 DEFAULT_CONFIG = {
     "listen_ip": "0.0.0.0",
@@ -233,7 +251,7 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_PATH, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
-    print(f"Config saved to {CONFIG_PATH}")
+    log.debug("Config saved to %s", CONFIG_PATH)
 
 
 # ---- WLED discovery ----------------------------------------------------------
@@ -565,18 +583,19 @@ class WledClient:
             return
         try:
             if self.debug:
-                print(f"-> WLED {self.ip}: {payload}")
+                log.debug("-> WLED %s: %s", self.ip, payload)
             self._session.post(f"http://{self.ip}/json/state", json=payload,
                                timeout=timeout)
             with self._lock:
                 self._backoff = 0.0
                 if not self._online:
-                    print(f"WLED {self.ip} back online.")
+                    log.info("WLED %s back online.", self.ip)
                     self._online = True
         except requests.RequestException as e:
             with self._lock:
                 if self._online:
-                    print(f"WLED {self.ip} unreachable ({e}); will keep retrying.")
+                    log.warning("WLED %s unreachable (%s); will keep retrying.",
+                                self.ip, e)
                     self._online = False
                 if self._shutting_down:
                     # Don't requeue during shutdown: the frozen queue must not
@@ -605,7 +624,7 @@ class WledClient:
             return self._session.get(f"http://{self.ip}/json/state",
                                      timeout=timeout).json()
         except (requests.RequestException, ValueError) as e:
-            print(f"Could not read WLED {self.ip} state: {e}")
+            log.warning("Could not read WLED %s state: %s", self.ip, e)
             return None
 
 
@@ -650,9 +669,9 @@ class DdpSender:
         if len(data) == expected:
             return data
         if not self._warned_len:
-            print(f"DDP {self.addr[0]}: got {len(data)} bytes, expected "
-                  f"{expected} ({led_count} LEDs); check led_count. "
-                  "Clipping/padding to fit.")
+            log.warning("DDP %s: got %d bytes, expected %d (%d LEDs); check "
+                        "led_count. Clipping/padding to fit.",
+                        self.addr[0], len(data), expected, led_count)
             self._warned_len = True
         if len(data) > expected:
             return data[:expected]
@@ -687,11 +706,12 @@ class DdpSender:
                     break
         except OSError as e:
             if not self._send_failed:
-                print(f"DDP {self.addr[0]} send failed ({e}); will keep trying.")
+                log.warning("DDP %s send failed (%s); will keep trying.",
+                            self.addr[0], e)
                 self._send_failed = True
             return False
         if self._send_failed:
-            print(f"DDP {self.addr[0]} send recovered.")
+            log.info("DDP %s send recovered.", self.addr[0])
             self._send_failed = False
         return True
 
@@ -930,11 +950,11 @@ class FrameSync(threading.Thread):
                     lost = True
                     self.bridge.ndi_connected = False
                     next_reconnect = now
-                    print("[NDI] source lost (no frames); reconnecting...")
+                    log.warning("NDI source lost (no frames); reconnecting...")
                 if lost and now >= next_reconnect \
                         and hasattr(self.source, "reconnect"):
                     if self.source.reconnect():
-                        print("[NDI] receiver reconnected; awaiting frames.")
+                        log.info("NDI receiver reconnected; awaiting frames.")
                     else:
                         reconnect_backoff = min(reconnect_backoff * 2, 30.0)
                     next_reconnect = now + reconnect_backoff
@@ -943,7 +963,7 @@ class FrameSync(threading.Thread):
             if lost:
                 lost = False
                 reconnect_backoff = 2.0
-                print("[NDI] source recovered.")
+                log.info("NDI source recovered.")
             self.bridge.ndi_connected = True
             self.bridge.last_activity = now
             if now < next_t:
@@ -958,8 +978,8 @@ class FrameSync(threading.Thread):
                 self._next_log = now + 2.0
                 lit = float((_lum(frame) > LUM_THRESHOLD).mean()) * 100.0
                 head = sample_gradient(frame, 5).tolist()
-                print(f"[frame] shape={frame.shape} lit={lit:.1f}% "
-                      f"5-bin sample={head}")
+                log.debug("frame shape=%s lit=%.1f%% 5-bin sample=%s",
+                          frame.shape, lit, head)
             for d in self.devices:
                 if self.mode == "gradient":
                     if frame is None:
@@ -1307,11 +1327,11 @@ class Watchdog(threading.Thread):
             if self.bridge.idle:
                 if quiet < timeout:
                     self.bridge.idle = False
-                    print("\n[watchdog] Modulaser is back; resuming.")
+                    log.info("watchdog: Modulaser is back; resuming.")
             elif quiet >= timeout:
                 self.bridge.idle = True
-                print(f"\n[watchdog] No Modulaser activity for "
-                      f"{self.cfg['watchdog_minutes']} min; restoring lighting.")
+                log.info("watchdog: no Modulaser activity for %s min; "
+                         "restoring lighting.", self.cfg["watchdog_minutes"])
                 for d in self.devices:
                     if d.idle_preset is not None:
                         d.client.queue_raw({"ps": int(d.idle_preset)})
@@ -1452,7 +1472,16 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="log intended WLED/DDP writes instead of sending; "
                              "no hardware or discovery needed")
+    parser.add_argument("--headless", action="store_true",
+                        help="run without the interactive prompt (service mode); "
+                             "uses saved device selection and color source")
+    parser.add_argument("--log-level", default="info",
+                        choices=["debug", "info", "warning", "error"],
+                        help="logging verbosity (default: info)")
+    parser.add_argument("--log-file", help="also write logs to this file")
     args = parser.parse_args()
+
+    setup_logging("debug" if args.debug else args.log_level, args.log_file)
 
     try:
         cfg = load_config()
@@ -1460,23 +1489,34 @@ def main():
         print(f"Config error in {CONFIG_PATH.name}: {e}")
         raise SystemExit(2)
 
+    # A non-interactive run (headless service, or piped stdin) can't prompt.
+    non_interactive = args.headless or not sys.stdin.isatty()
+
     if args.dry_run:
         ips = cfg.get("selected") or ["127.0.0.1"]
         print(f"--dry-run: no hardware; simulating device(s): {', '.join(ips)}")
+    elif args.headless:
+        ips = cfg.get("selected")
+        if not ips:
+            log.error("--headless needs a saved device selection; run once "
+                      "interactively or set 'selected'/'devices' in %s.",
+                      CONFIG_PATH.name)
+            raise SystemExit(2)
+        log.info("headless: using device(s) %s", ", ".join(ips))
     elif args.auto and cfg.get("selected"):
         ips = cfg["selected"]
         print(f"--auto: using last selection: {', '.join(ips)}")
     else:
         ips = select_devices(cfg)
 
-    source = args.source
+    source = args.source or (cfg.get("color_source") if non_interactive else None)
     if not source:
         source = prompt_choice("Color source:", [
             ("osc", "OSC base color (clip/layer color, Colorize, effects)"),
             ("ndi", "NDI frame sync (gradients & animated colors)"),
         ], last=cfg.get("color_source"))
     mode = args.mode or cfg.get("ndi_mode") or "gradient"
-    if source == "ndi" and not args.mode:
+    if source == "ndi" and not args.mode and not non_interactive:
         mode = prompt_choice("Frame mapping:", [
             ("gradient", "Per-LED gradient (colors flow along the strip, DDP)"),
             ("dominant", "Dominant color (segments follow the strongest color)"),
@@ -1533,7 +1573,7 @@ def main():
         SimpleUDPClient(cfg["modulaser_ip"],
                         cfg["modulaser_osc_in_port"]).send_message("/refresh", [])
     except OSError as e:
-        print(f"Could not send /refresh to Modulaser: {e}")
+        log.warning("Could not send /refresh to Modulaser: %s", e)
 
     print(f"\nBridging Modulaser ({cfg['listen_ip']}:{cfg['listen_port']}) "
           f"-> {len(devices)} WLED device(s)"
@@ -1548,24 +1588,44 @@ def main():
         print("Beat flash is ON")
     if bridge.fill_enabled:
         print("Fill light is ON (LEDs only while lasers are dark)")
-    print("Type 'help' for live commands (mode / beat / status / quit). "
-          "Ctrl+C also quits"
-          + (" (WLED state will be restored)." if restores else "."))
 
+    def wait_for_signal():
+        """Block until Ctrl+C / SIGTERM (systemd, Task Scheduler stop)."""
+        stop_evt = threading.Event()
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
+        except (ValueError, AttributeError):
+            pass  # not the main thread / unsupported platform
+        stop_evt.wait()
+
+    tail = " (WLED state will be restored)." if restores else "."
     try:
-        while True:
-            try:
-                line = input("> ").strip().lower()
-            except EOFError:
-                # no interactive stdin (e.g. running as a service): idle here
-                time.sleep(1)
-                continue
-            if controller.handle_command(line):
-                break
+        if args.headless:
+            print("Running headless; Ctrl+C or SIGTERM to quit" + tail)
+            wait_for_signal()
+        else:
+            interactive = sys.stdin.isatty()
+            if interactive:
+                print("Type 'help' for live commands (mode / beat / status / "
+                      "quit). Ctrl+C also quits" + tail)
+            quit_requested = False
+            while True:
+                try:
+                    line = input("> " if interactive else "").strip().lower()
+                except EOFError:
+                    break
+                if controller.handle_command(line):
+                    quit_requested = True
+                    break
+            if not quit_requested and not interactive:
+                # stdin closed but we weren't told to quit (service without a
+                # console): idle on a signal instead of busy-looping or exiting.
+                print("stdin closed; running until Ctrl+C or SIGTERM" + tail)
+                wait_for_signal()
     except KeyboardInterrupt:
         pass
     finally:
-        print("\nShutting down...")
+        log.info("Shutting down...")
         beat.stop()
         watchdog.stop()
         if controller.framesync:
@@ -1581,7 +1641,7 @@ def main():
         for d in devices:
             d.client.stop()
         for client, snap in restores:
-            print(f"Restoring {client.ip}...")
+            log.info("Restoring %s...", client.ip)
             client.post_state(snap, timeout=3)
         for d in devices:
             d.client.close()
