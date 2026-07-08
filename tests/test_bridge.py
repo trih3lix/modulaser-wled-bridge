@@ -294,6 +294,19 @@ def test_validate_groups_must_be_mapping(tmp_path, monkeypatch):
     assert "groups" in str(ei.value)
 
 
+def test_local_subnet_honors_explicit_cidr():
+    net = mb.local_subnet("192.168.5.0/25")
+    assert str(net) == "192.168.5.0/25"
+    assert net.num_addresses == 128
+
+
+def test_validate_bad_sweep_cidr(tmp_path, monkeypatch):
+    _write_cfg(tmp_path, monkeypatch, "sweep_cidr: not-a-cidr\n")
+    with pytest.raises(mb.ConfigError) as ei:
+        mb.load_config()
+    assert "sweep_cidr" in str(ei.value)
+
+
 def test_load_config_merges_partial_effects(tmp_path, monkeypatch):
     p = tmp_path / "wled_bridge.yaml"
     p.write_text("effects:\n  strobe: 99\n")

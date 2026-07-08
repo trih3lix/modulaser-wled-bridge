@@ -101,6 +101,7 @@ DEFAULT_CONFIG = {
     "fill_light": False,
     "fill_threshold": 0.002,
     "watchdog_minutes": 10,
+    "sweep_cidr": None,  # override the auto-detected subnet for the 's' sweep
     "devices": {},
     "selected": [],
 }
@@ -195,6 +196,11 @@ def validate_config(cfg):
                 f"segment(s), got {groups!r}")
     if not isinstance(cfg.get("selected"), list):
         raise ConfigError("selected: must be a list of device IPs")
+    if cfg.get("sweep_cidr"):
+        try:
+            ipaddress.ip_network(cfg["sweep_cidr"], strict=False)
+        except ValueError as e:
+            raise ConfigError(f"sweep_cidr: {e}")
     return cfg
 
 
@@ -314,7 +320,11 @@ def discover_mdns(seconds=5):
         d.close()
 
 
-def local_subnet():
+def local_subnet(cidr=None):
+    """Return the network to sweep. Honors an explicit CIDR (from config);
+    otherwise infers the local IP via the default route and assumes /24."""
+    if cidr:
+        return ipaddress.ip_network(cidr, strict=False)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -324,12 +334,25 @@ def local_subnet():
     return ipaddress.ip_network(f"{ip}/24", strict=False)
 
 
-def discover_subnet():
-    net = local_subnet()
-    print(f"Sweeping {net} (this takes a few seconds)...")
+def discover_subnet(cfg=None):
+    cidr = (cfg or {}).get("sweep_cidr")
+    try:
+        net = local_subnet(cidr)
+    except ValueError as e:
+        print(f"Invalid sweep_cidr {cidr!r}: {e}")
+        return []
+    hosts = list(net.hosts())
+    if cidr:
+        print(f"Sweeping {net} (from sweep_cidr), {len(hosts)} hosts...")
+    else:
+        print(f"Sweeping {net} (auto-detected; set 'sweep_cidr' in "
+              f"wled_bridge.yaml to override), {len(hosts)} hosts...")
+    if len(hosts) > 1024:
+        print("  That's a large range and may take a while; a narrower "
+              "sweep_cidr will be faster.")
     devices = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-        for result in pool.map(probe_wled, (str(h) for h in net.hosts())):
+        for result in pool.map(probe_wled, (str(h) for h in hosts)):
             if result:
                 devices.append(result)
     return devices
@@ -375,7 +398,7 @@ def select_devices(cfg, initial_wait=5):
                     time.sleep(3)
                     continue
                 if answer == "s":
-                    for d in discover_subnet():
+                    for d in discover_subnet(cfg):
                         discovery._record(d["ip"], d)
                     continue
                 return [answer]
@@ -396,7 +419,7 @@ def select_devices(cfg, initial_wait=5):
                 continue
             if raw == "s":
                 print("Sweeping the subnet...")
-                for d in discover_subnet():
+                for d in discover_subnet(cfg):
                     discovery._record(d["ip"], d)
                 continue
             if not raw and last:
