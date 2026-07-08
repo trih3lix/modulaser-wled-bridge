@@ -344,6 +344,7 @@ class WledClient:
         self._stop = threading.Event()
         self._online = True
         self._shutting_down = False
+        self._backoff = 0.0
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -413,6 +414,7 @@ class WledClient:
             requests.post(f"http://{self.ip}/json/state", json=payload,
                           timeout=timeout)
             with self._lock:
+                self._backoff = 0.0
                 if not self._online:
                     print(f"WLED {self.ip} back online.")
                     self._online = True
@@ -434,8 +436,12 @@ class WledClient:
                         segs.setdefault(sid, {}).update(fields)
                     merged["seg"] = segs
                 self._pending = merged
+                self._backoff = min(max(0.5, self._backoff * 2), 8.0)
+                backoff = self._backoff
             self._dirty.set()
-            time.sleep(1)
+            # Interruptible: a stop() during a dead-device backoff wakes at once
+            # instead of blocking shutdown for the full pause.
+            self._stop.wait(backoff)
 
     def get_state(self, timeout=2):
         try:
